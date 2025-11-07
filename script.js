@@ -1,31 +1,20 @@
 // Global variables
 let jsonData = null;
-let nodes = [];
-let links = [];
-let allNodes = []; // Store all nodes (not just visible ones)
-let allLinks = []; // Store all links (not just visible ones)
-let simulation = null;
-let zoom = null;
-let svg = null;
-let g = null;
-let width = 0;
-let height = 0;
-let currentTransform = d3.zoomIdentity;
-let visibleNodes = new Set();
+let allNodes = []; // Store all nodes (Neo4j-style graph data)
+let allEdges = []; // Store all edges (relationships in Neo4j style)
+let network = null; // vis.js Network instance
+let data = null; // vis.js DataSet for nodes and edges
+let nodesDataSet = null;
+let edgesDataSet = null;
 let maxInitialDepth = 3; // Limit initial depth
 let expandedNodes = new Set(); // Track expanded nodes
-let renderThrottle = null;
-let lastRenderTime = 0;
-let lastTickTime = 0;
-const RENDER_THROTTLE_MS = 16; // ~60fps
-const TICK_THROTTLE_MS = 50; // Update viewport less frequently during simulation
-let tickUpdateCounter = 0;
 let focusedNodeId = null; // Currently focused node for drill-down
 let navigationStack = []; // Stack of node IDs for back navigation
 let nodeJsonPath = new Map(); // Map node ID to JSON path for highlighting
 let selectedResourceType = null; // Currently selected resourceType filter
 let resourceTypeColors = new Map(); // Color mapping for each resourceType
 let isCleared = false; // Whether the view has been cleared
+let searchHighlightedNodes = new Set(); // Nodes highlighted by search
 
 // DOM elements
 const fileInput = document.getElementById('fileInput');
@@ -34,7 +23,6 @@ const jsonEditor = document.getElementById('jsonEditor');
 const visualizeBtn = document.getElementById('visualizeBtn');
 const validIndicator = document.getElementById('validIndicator');
 const vizContainer = document.getElementById('vizContainer');
-const graphSvg = document.getElementById('graphSvg');
 const zoomInBtn = document.getElementById('zoomInBtn');
 const zoomOutBtn = document.getElementById('zoomOutBtn');
 const fitViewBtn = document.getElementById('fitViewBtn');
@@ -137,13 +125,29 @@ function visualizeJSON() {
         const jsonText = jsonEditor.value;
         const fileSizeMB = new Blob([jsonText]).size / (1024 * 1024);
         
-        // Reset navigation state
+        // Reset all state for a fresh build
+        allNodes = [];
+        allEdges = [];
+        nodeJsonPath.clear();
+        nodeIdCounter = 0;
+        edgeIdCounter = 0;
+        expandedNodes.clear();
         focusedNodeId = null;
         navigationStack = [];
-        selectedResourceType = null; // Clear resourceType filter when visualizing new JSON
-        isCleared = false; // Reset cleared state when visualizing new JSON
-        resourceTypeColors.clear(); // Clear color cache when loading new JSON
+        selectedResourceType = null;
+        lastExpandedResourceType = null;
+        isCleared = false;
+        resourceTypeColors.clear();
+        searchHighlightedNodes.clear();
         updateBackButtonVisibility();
+        
+        // Clear the visualization
+        if (nodesDataSet) {
+            nodesDataSet.clear();
+        }
+        if (edgesDataSet) {
+            edgesDataSet.clear();
+        }
         
         // Show loading indicator for large files
         if (fileSizeMB > 1) {
@@ -167,12 +171,12 @@ function visualizeJSON() {
         // Build graph asynchronously for large files
         if (fileSizeMB > 1) {
             setTimeout(() => {
-                buildGraph(jsonData);
+                buildGraph(jsonData, true); // true indicates fresh build
                 hideLoadingIndicator();
                 renderGraph();
             }, 10);
         } else {
-            buildGraph(jsonData);
+            buildGraph(jsonData, true); // true indicates fresh build
             renderGraph();
         }
     } catch (e) {
@@ -210,7 +214,6 @@ function findMainArray(data, path = []) {
         if (obj === null || obj === undefined) return;
         
         if (Array.isArray(obj)) {
-            // Count objects in this array (especially those with resourceType)
             let objectCount = 0;
             let resourceTypeCount = 0;
             
@@ -223,17 +226,14 @@ function findMainArray(data, path = []) {
                 }
             });
             
-            // Use resourceType count as primary metric, fall back to object count
             const score = resourceTypeCount > 0 ? resourceTypeCount * 1000 + objectCount : objectCount;
             
-            // If this array has more objects/resourceTypes, it's the main array
             if (score > maxObjects) {
                 maxObjects = score;
                 mainArray = obj;
                 mainArrayPath = [...currentPath];
             }
         } else if (typeof obj === 'object') {
-            // Recursively check all properties
             Object.entries(obj).forEach(([key, value]) => {
                 traverse(value, [...currentPath, key]);
             });
@@ -244,85 +244,189 @@ function findMainArray(data, path = []) {
     return { array: mainArray, path: mainArrayPath };
 }
 
-function buildGraph(data) {
-    // Preserve expanded nodes when rebuilding
-    const previousExpandedNodes = new Set(expandedNodes);
+// Global counters for node and edge IDs (persistent across expansions)
+let nodeIdCounter = 0;
+let edgeIdCounter = 0;
+
+// Helper function to create a node (used by both buildGraph and expandNode)
+function createNodeForGraph(label, value, type, parentId, depth, rawData, childrenCount, isCollapsed, jsonPath, resourceType, isExpanded) {
+    const id = nodeIdCounter++;
     
-    // Preserve navigation state - we'll try to restore it after rebuilding
-    const savedFocusedPath = focusedNodeId !== null 
+    // Determine node color and styling (Neo4j-style)
+    let color = '#ffffff';
+    let borderColor = '#333333';
+    
+    if (type === 'color' && value) {
+        color = value;
+        borderColor = '#333333';
+    } else if (resourceType) {
+        color = getResourceTypeColor(resourceType);
+        const rgb = hexToRgb(color);
+        if (rgb) {
+            borderColor = `rgb(${Math.max(0, rgb.r - 40)}, ${Math.max(0, rgb.g - 40)}, ${Math.max(0, rgb.b - 40)})`;
+        }
+    } else {
+        switch(type) {
+            case 'array':
+                color = '#e3f2fd';
+                borderColor = '#2196f3';
+                break;
+            case 'object':
+                color = '#f3e5f5';
+                borderColor = '#9c27b0';
+                break;
+            case 'string':
+                color = '#e8f5e9';
+                borderColor = '#4caf50';
+                break;
+            case 'number':
+                color = '#fff3e0';
+                borderColor = '#ff9800';
+                break;
+            case 'boolean':
+                color = '#fce4ec';
+                borderColor = '#e91e63';
+                break;
+            default:
+                color = '#ffffff';
+                borderColor = '#333333';
+        }
+    }
+    
+    const textColor = getContrastColor(color);
+    
+    let displayLabel = label;
+    const hasChildren = (type === 'array' || type === 'object') && rawData !== null && 
+                      ((Array.isArray(rawData) && rawData.length > 0) || 
+                       (typeof rawData === 'object' && Object.keys(rawData).length > 0));
+    
+    const actuallyCollapsed = hasChildren && !isExpanded && !expandedNodes.has(id);
+    
+    if (actuallyCollapsed && childrenCount > 0) {
+        displayLabel = label + ' ▶';
+    }
+    
+    const newNode = {
+        id: id,
+        label: displayLabel,
+        title: label + (hasChildren ? ` (${childrenCount} ${childrenCount === 1 ? 'child' : 'children'})` : ''),
+        type: type,
+        parentId: parentId,
+        depth: depth,
+        rawData: rawData,
+        childrenCount: childrenCount,
+        isCollapsed: actuallyCollapsed,
+        children: [],
+        jsonPath: jsonPath || [],
+        resourceType: resourceType,
+        isExpanded: isExpanded || expandedNodes.has(id),
+        color: {
+            background: color,
+            border: borderColor,
+            highlight: {
+                background: color,
+                border: '#007bff'
+            },
+            hover: {
+                background: color,
+                border: '#0056b3'
+            }
+        },
+        font: {
+            color: textColor,
+            size: 14,
+            face: 'Arial'
+        },
+        shape: 'box',
+        borderWidth: 2,
+        shadow: true
+    };
+    
+    if (jsonPath) {
+        nodeJsonPath.set(id, jsonPath);
+    }
+    
+    if (parentId !== null) {
+        const edge = {
+            id: edgeIdCounter++,
+            from: parentId,
+            to: id,
+            label: '',
+            arrows: 'to',
+            color: {
+                color: '#999999',
+                highlight: '#007bff',
+                hover: '#0056b3'
+            },
+            width: 2,
+            smooth: {
+                type: 'curvedCW',
+                roundness: 0.2
+            }
+        };
+        allEdges.push(edge);
+        const parentNode = allNodes.find(n => n.id === parentId);
+        if (parentNode) {
+            parentNode.children.push(id);
+        }
+    }
+    
+    const existingNodeIndex = allNodes.findIndex(n => n.id === id);
+    if (existingNodeIndex === -1) {
+        allNodes.push(newNode);
+    } else {
+        allNodes[existingNodeIndex] = newNode;
+    }
+    
+    return id;
+}
+
+function buildGraph(data, isFreshBuild = false) {
+    // If this is a fresh build, reset everything
+    if (isFreshBuild) {
+        allNodes = [];
+        allEdges = [];
+        nodeJsonPath.clear();
+        nodeIdCounter = 0;
+        edgeIdCounter = 0;
+        expandedNodes.clear();
+        focusedNodeId = null;
+        navigationStack = [];
+    }
+    
+    // Preserve navigation state (only if not a fresh build)
+    const savedFocusedPath = !isFreshBuild && focusedNodeId !== null 
         ? allNodes.find(n => n.id === focusedNodeId)?.jsonPath 
         : null;
-    const savedStackPaths = navigationStack.map(id => 
-        allNodes.find(n => n.id === id)?.jsonPath
-    ).filter(p => p !== undefined);
+    const savedStackPaths = !isFreshBuild && navigationStack.length > 0
+        ? navigationStack.map(id => 
+            allNodes.find(n => n.id === id)?.jsonPath
+          ).filter(p => p !== undefined)
+        : [];
     
     // Find the main array with the most sub-objects
     const mainArrayInfo = findMainArray(data);
     let rootData = data;
     let rootKey = 'root';
     
-    // If we found a main array, use it as the root
     if (mainArrayInfo.array && mainArrayInfo.array.length > 0) {
         rootData = mainArrayInfo.array;
-        // Use the last part of the path as the root key (e.g., "entry" for FHIR bundles)
         rootKey = mainArrayInfo.path.length > 0 
             ? mainArrayInfo.path[mainArrayInfo.path.length - 1] 
             : 'main';
     }
     
-    allNodes = [];
-    allLinks = [];
-    nodes = [];
-    links = [];
-    nodeJsonPath.clear();
-    const nodeMap = new Map();
-    let nodeId = 0;
-    
-    function createNode(label, value, type, parentId = null, depth = 0, rawData = null, childrenCount = 0, isCollapsed = false, jsonPath = null, resourceType = null) {
-        const id = nodeId++;
-        const node = {
-            id,
-            label,
-            value,
-            type,
-            parentId,
-            depth,
-            rawData, // Store original data for lazy expansion
-            childrenCount,
-            isCollapsed: isCollapsed || (depth >= maxInitialDepth && childrenCount > 0),
-            x: Math.random() * 800 + 400,
-            y: Math.random() * 600 + 300,
-            children: [], // Store child node IDs
-            jsonPath: jsonPath || [], // Store path in JSON for highlighting
-            resourceType: resourceType || null // Store resourceType for filtering
-        };
-        
-        // Store JSON path mapping
-        if (jsonPath) {
-            nodeJsonPath.set(id, jsonPath);
-        }
-        
-        if (parentId !== null) {
-            const linkData = {
-                source: parentId,
-                target: id,
-                label: label,
-                id: `link-${parentId}-${id}`
-            };
-            allLinks.push(linkData);
-            const parentNode = nodeMap.get(parentId);
-            if (parentNode) {
-                parentNode.children.push(id);
-            }
-        }
-        
-        allNodes.push(node);
-        nodeMap.set(id, node);
-        return id;
+    // Only create root node if this is a fresh build
+    if (isFreshBuild && allNodes.length === 0) {
+        // Will be created below
     }
     
-    function processValue(value, parentId, key = 'root', depth = 0, parentPath = [], parentResourceType = null) {
-        const currentPath = parentId === null ? [] : [...parentPath, key];
+    // Use the global createNodeForGraph function
+    const createNode = createNodeForGraph;
+    
+    function processValue(value, parentId, key = 'root', depth = 0, parentPath = [], parentResourceType = null, shouldExpandChildren = false) {
+        // Build current path: if parentId is null, use parentPath as is (for root), otherwise append key
+        const currentPath = parentId === null ? parentPath : [...parentPath, key];
         
         // Check if this object has a resourceType
         let currentResourceType = parentResourceType;
@@ -331,7 +435,7 @@ function buildGraph(data) {
         }
         
         if (value === null) {
-            return createNode(key, 'null', 'null', parentId, depth, null, 0, false, currentPath, currentResourceType);
+            return createNode(key, 'null', 'null', parentId, depth, null, 0, false, currentPath, currentResourceType, false);
         }
         
         const valueType = typeof value;
@@ -345,22 +449,23 @@ function buildGraph(data) {
                 depth, 
                 value, 
                 value.length,
-                depth >= maxInitialDepth,
+                true, // Always start collapsed (lazy loading)
                 currentPath,
-                currentResourceType
+                currentResourceType,
+                shouldExpandChildren // Only expand if explicitly requested
             );
             
-            // Check if node should be expanded
-            const shouldExpand = depth < maxInitialDepth || previousExpandedNodes.has(arrayNodeId) || expandedNodes.has(arrayNodeId);
-            if (shouldExpand) {
+            // Only expand if this node has been marked as expanded
+            if (shouldExpandChildren || expandedNodes.has(arrayNodeId)) {
                 value.forEach((item, index) => {
-                    processValue(item, arrayNodeId, key, depth + 1, currentPath, currentResourceType);
+                    processValue(item, arrayNodeId, String(index), depth + 1, currentPath, currentResourceType, false);
                 });
+                // Mark as expanded
+                expandedNodes.add(arrayNodeId);
             }
             return arrayNodeId;
         } else if (valueType === 'object') {
             const keys = Object.keys(value);
-            // If object has a resourceType, use that as the label instead of the key
             let labelText;
             if (value.resourceType) {
                 labelText = `${value.resourceType}`;
@@ -376,17 +481,19 @@ function buildGraph(data) {
                 depth,
                 value,
                 keys.length,
-                depth >= maxInitialDepth,
+                true, // Always start collapsed (lazy loading)
                 currentPath,
-                currentResourceType
+                currentResourceType,
+                shouldExpandChildren // Only expand if explicitly requested
             );
             
-            // Check if node should be expanded
-            const shouldExpand = depth < maxInitialDepth || previousExpandedNodes.has(objNodeId) || expandedNodes.has(objNodeId);
-            if (shouldExpand) {
+            // Only expand if this node has been marked as expanded
+            if (shouldExpandChildren || expandedNodes.has(objNodeId)) {
                 Object.entries(value).forEach(([k, v]) => {
-                    processValue(v, objNodeId, k, depth + 1, currentPath, currentResourceType);
+                    processValue(v, objNodeId, k, depth + 1, currentPath, currentResourceType, false);
                 });
+                // Mark as expanded
+                expandedNodes.add(objNodeId);
             }
             return objNodeId;
         } else {
@@ -398,24 +505,31 @@ function buildGraph(data) {
             let labelText = `${key}`;
             if (valueType === 'string' && /^#[0-9A-Fa-f]{6}$/.test(value)) {
                 labelText = `${key}: ${value}`;
-                return createNode(labelText, value, 'color', parentId, depth, null, 0, false, currentPath, currentResourceType);
+                return createNode(labelText, value, 'color', parentId, depth, null, 0, false, currentPath, currentResourceType, false);
             } else {
                 labelText = `${key}: ${displayValue}`;
             }
             
-            return createNode(labelText, value, valueType, parentId, depth, null, 0, false, currentPath, currentResourceType);
+            return createNode(labelText, value, valueType, parentId, depth, null, 0, false, currentPath, currentResourceType, false);
         }
     }
     
-    // Process the root data (either the main array or the original data)
-    if (typeof rootData === 'object' && rootData !== null) {
-        processValue(rootData, null, rootKey, 0, []);
-    } else {
-        createNode(rootKey, String(rootData), typeof rootData, null, 0, null, 0, false, []);
+    // Process the root data - only create root node initially (lazy loading)
+    // Only do this if it's a fresh build (we already cleared allNodes above)
+    if (isFreshBuild) {
+        // First time building - only create root node
+        // Store the path based on whether we're using main array or full data
+        const rootPath = mainArrayInfo.path.length > 0 ? [...mainArrayInfo.path] : [];
+        if (typeof rootData === 'object' && rootData !== null) {
+            // For root, use the actual path from JSON structure
+            processValue(rootData, null, rootKey, 0, rootPath, null, false); // Don't expand children
+        } else {
+            createNode(rootKey, String(rootData), typeof rootData, null, 0, null, 0, false, rootPath, null, false);
+        }
     }
     
-    // Restore navigation state by finding nodes with matching paths
-    if (savedFocusedPath) {
+    // Restore navigation state (only if not a fresh build)
+    if (!isFreshBuild && savedFocusedPath) {
         const restoredFocusedNode = allNodes.find(n => 
             n.jsonPath && 
             n.jsonPath.length === savedFocusedPath.length &&
@@ -429,8 +543,8 @@ function buildGraph(data) {
         }
     }
     
-    // Restore navigation stack
-    if (savedStackPaths.length > 0) {
+    // Restore navigation stack (only if not a fresh build)
+    if (!isFreshBuild && savedStackPaths.length > 0) {
         navigationStack = savedStackPaths.map(path => {
             const node = allNodes.find(n => 
                 n.jsonPath && 
@@ -441,199 +555,380 @@ function buildGraph(data) {
         }).filter(id => id !== undefined);
     }
     
-    // Initially, all nodes are in the visible set
-    updateVisibleNodes();
-    
-    // Update back button visibility
     updateBackButtonVisibility();
 }
 
 function initializeVisualization() {
-    width = vizContainer.clientWidth;
-    height = vizContainer.clientHeight;
+    // Create vis.js DataSets
+    nodesDataSet = new vis.DataSet([]);
+    edgesDataSet = new vis.DataSet([]);
     
-    svg = d3.select('#graphSvg')
-        .attr('width', width)
-        .attr('height', height);
+    data = {
+        nodes: nodesDataSet,
+        edges: edgesDataSet
+    };
     
-    g = svg.append('g');
+    // Configure Neo4j-style options
+    const options = {
+        nodes: {
+            shape: 'box',
+            font: {
+                size: 14,
+                face: 'Arial'
+            },
+            borderWidth: 2,
+            shadow: true,
+            margin: 10,
+            widthConstraint: {
+                minimum: 100,
+                maximum: 200
+            },
+            heightConstraint: {
+                minimum: 30
+            }
+        },
+        edges: {
+            arrows: {
+                to: {
+                    enabled: true,
+                    scaleFactor: 0.5
+                }
+            },
+            color: {
+                color: '#999999',
+                highlight: '#007bff',
+                hover: '#0056b3'
+            },
+            width: 2,
+            smooth: {
+                type: 'curvedCW',
+                roundness: 0.2
+            }
+        },
+        physics: {
+            enabled: true,
+            stabilization: {
+                enabled: true,
+                iterations: 200,
+                fit: true
+            },
+            barnesHut: {
+                gravitationalConstant: -2000,
+                centralGravity: 0.3,
+                springLength: 200,
+                springConstant: 0.04,
+                damping: 0.09,
+                avoidOverlap: 1
+            }
+        },
+        interaction: {
+            dragNodes: true,
+            dragView: true,
+            zoomView: true,
+            selectConnectedEdges: true,
+            tooltipDelay: 100,
+            hover: true
+        },
+        layout: {
+            improvedLayout: true,
+            hierarchical: {
+                enabled: false
+            }
+        }
+    };
     
-    // Set up zoom behavior with throttled updates
-    zoom = d3.zoom()
-        .scaleExtent([0.1, 4])
-        .on('zoom', (event) => {
-            currentTransform = event.transform;
-            g.attr('transform', event.transform);
-            throttledUpdateViewport();
-        });
+    // Create network
+    const networkContainer = document.getElementById('neo4jNetwork');
+    network = new vis.Network(networkContainer, data, options);
     
-    svg.call(zoom);
+    // Handle single click - highlight JSON
+    let clickTimeout = null;
+    network.on('click', (params) => {
+        if (params.nodes.length > 0) {
+            const nodeId = params.nodes[0];
+            const node = allNodes.find(n => n.id === nodeId);
+            if (node) {
+                // Single click - highlight JSON
+                clearTimeout(clickTimeout);
+                clickTimeout = setTimeout(() => {
+                    highlightJsonForNode(node);
+                }, 300); // Wait to see if it's a double click
+            }
+        } else {
+            // Clicked on empty space - clear selection
+            network.unselectAll();
+            clearTimeout(clickTimeout);
+        }
+    });
+    
+    // Handle double click - expand node
+    network.on('doubleClick', (params) => {
+        clearTimeout(clickTimeout); // Cancel single click handler
+        if (params.nodes.length > 0) {
+            const nodeId = params.nodes[0];
+            const node = allNodes.find(n => n.id === nodeId);
+            if (node) {
+                expandNode(node);
+            }
+        }
+    });
     
     // Handle window resize
     window.addEventListener('resize', () => {
-        width = vizContainer.clientWidth;
-        height = vizContainer.clientHeight;
-        svg.attr('width', width).attr('height', height);
-        if (nodes.length > 0) {
-            fitToView();
+        if (network) {
+            network.redraw();
+            setTimeout(() => {
+                fitToView();
+            }, 100);
         }
     });
 }
 
-// Throttled viewport update
-function throttledUpdateViewport() {
-    const now = performance.now();
-    if (now - lastRenderTime < RENDER_THROTTLE_MS) {
-        if (renderThrottle) {
-            cancelAnimationFrame(renderThrottle);
-        }
-        renderThrottle = requestAnimationFrame(() => {
-            updateVisibleNodes();
-            renderVisibleGraph();
-        });
+// Expand all paths to nodes with a specific resourceType
+function expandPathsToResourceType(resourceType) {
+    if (!jsonData || !resourceType) {
+        console.warn('expandPathsToResourceType called with invalid data:', { jsonData: !!jsonData, resourceType });
         return;
     }
-    lastRenderTime = now;
-    updateVisibleNodes();
-    renderVisibleGraph();
+    
+    // Find all paths to nodes with this resourceType in the JSON data
+    const pathsToExpand = [];
+    
+    function findResourceTypePaths(data, path = [], parentResourceType = null) {
+        if (data === null || data === undefined) return;
+        
+        // Check if this object has the target resourceType
+        if (typeof data === 'object' && !Array.isArray(data) && data.resourceType === resourceType) {
+            pathsToExpand.push([...path]);
+        }
+        
+        // Determine current resourceType for propagation
+        let currentResourceType = parentResourceType;
+        if (typeof data === 'object' && !Array.isArray(data) && data.resourceType) {
+            currentResourceType = data.resourceType;
+        }
+        
+        if (Array.isArray(data)) {
+            data.forEach((item, index) => {
+                findResourceTypePaths(item, [...path, String(index)], currentResourceType);
+            });
+        } else if (typeof data === 'object') {
+            Object.entries(data).forEach(([key, value]) => {
+                findResourceTypePaths(value, [...path, key], currentResourceType);
+            });
+        }
+    }
+    
+    findResourceTypePaths(jsonData);
+    
+    console.log(`Found ${pathsToExpand.length} paths to resourceType "${resourceType}"`);
+    if (pathsToExpand.length > 0) {
+        console.log('Sample paths:', pathsToExpand.slice(0, 3));
+    }
+    
+    // Check root node path
+    const rootNode = allNodes.find(n => n.parentId === null);
+    if (rootNode) {
+        console.log(`Root node path: [${rootNode.jsonPath.join(', ')}]`);
+    }
+    
+    // Expand each path - expand them all before checking
+    pathsToExpand.forEach((path, index) => {
+        expandPathInGraph(path);
+    });
+    
+    // After expanding all paths, verify nodes were created
+    const createdNodes = allNodes.filter(n => n.resourceType === resourceType);
+    console.log(`After expansion, found ${createdNodes.length} nodes with resourceType "${resourceType}"`);
+    if (createdNodes.length === 0 && pathsToExpand.length > 0) {
+        console.warn('No nodes created despite paths found. Checking all nodes:');
+        console.log('All nodes count:', allNodes.length);
+        console.log('Sample nodes:', allNodes.slice(0, 5).map(n => ({
+            id: n.id,
+            label: n.label,
+            resourceType: n.resourceType,
+            jsonPath: n.jsonPath
+        })));
+    }
 }
 
-// Calculate which nodes are visible in viewport
-function updateVisibleNodes() {
-    if (allNodes.length === 0) return;
-    
-    visibleNodes.clear();
-    
-    // If filtering by resourceType, include matching nodes AND their parent tree
-    if (selectedResourceType !== null) {
-        // Find all nodes matching the selected resourceType
-        const matchingNodes = allNodes.filter(n => n.resourceType === selectedResourceType);
-        
-        // For each matching node, add it and all its ancestors (parent tree)
-        matchingNodes.forEach(matchingNode => {
-            // Add the matching node itself
-            visibleNodes.add(matchingNode.id);
-            
-            // Trace back to root by following parentId chain
-            let currentNode = matchingNode;
-            while (currentNode.parentId !== null) {
-                const parentNode = allNodes.find(n => n.id === currentNode.parentId);
-                if (parentNode) {
-                    visibleNodes.add(parentNode.id);
-                    currentNode = parentNode;
-                } else {
-                    break;
-                }
-            }
-        });
+// Expand a path in the graph (create nodes if needed)
+function expandPathInGraph(path) {
+    if (!path || path.length === 0) {
         return;
     }
     
-    // Otherwise, use viewport-based visibility for performance
-    // Get viewport bounds in transformed coordinates
-    const transform = currentTransform;
-    const k = transform.k;
-    const x0 = -transform.x / k;
-    const y0 = -transform.y / k;
-    const x1 = x0 + width / k;
-    const y1 = y0 + height / k;
+    // Get the root node
+    const rootNode = allNodes.find(n => n.parentId === null);
+    if (!rootNode) {
+        console.warn('No root node found for path expansion');
+        return;
+    }
     
-    // Add padding to load nodes slightly outside viewport
-    const padding = 200 / k;
+    // Check if the path starts with the root node's path
+    const rootPath = rootNode.jsonPath || [];
     
-    allNodes.forEach(node => {
-        // Skip collapsed nodes (unless they have collapsed children that might be visible)
-        if (node.isCollapsed && node.parentId !== null) {
-            // Only show if the collapsed node itself is visible
-            if (node.x + node.width/2 >= x0 - padding &&
-                node.x - node.width/2 <= x1 + padding &&
-                node.y + node.height/2 >= y0 - padding &&
-                node.y - node.height/2 <= y1 + padding) {
-                visibleNodes.add(node.id);
+    // Verify path starts with root path
+    if (rootPath.length > 0) {
+        const pathMatchesRoot = path.length >= rootPath.length &&
+            rootPath.every((val, idx) => val === path[idx]);
+        if (!pathMatchesRoot) {
+            console.warn(`Path [${path.join(', ')}] does not start with root path [${rootPath.join(', ')}]`);
+            return;
+        }
+    }
+    
+    let currentNode = rootNode;
+    let currentData = jsonData;
+    
+    // Navigate to the root node's data in JSON
+    for (const key of rootPath) {
+        if (Array.isArray(currentData)) {
+            const index = parseInt(key);
+            if (!isNaN(index) && index < currentData.length) {
+                currentData = currentData[index];
             }
+        } else if (typeof currentData === 'object' && currentData !== null) {
+            if (key in currentData) {
+                currentData = currentData[key];
+            }
+        }
+    }
+    
+    // Start from after the root path
+    const startIndex = rootPath.length;
+    
+    // Now navigate the remaining path (children of root)
+    for (let i = startIndex; i < path.length; i++) {
+        const key = path[i];
+        
+        // Navigate JSON data
+        if (Array.isArray(currentData)) {
+            const index = parseInt(key);
+            if (isNaN(index) || index >= currentData.length) {
+                console.warn(`Invalid array index in path expansion: ${key} at index ${i}`);
+                return;
+            }
+            currentData = currentData[index];
+        } else if (typeof currentData === 'object' && currentData !== null) {
+            if (!(key in currentData)) {
+                console.warn(`Key not found in path expansion: ${key} at index ${i}`);
+                return;
+            }
+            currentData = currentData[key];
+        } else {
+            console.warn(`Cannot navigate path, reached non-object at: ${key}`);
             return;
         }
         
-        // Check if node is in viewport
-        if (node.x + node.width/2 >= x0 - padding &&
-            node.x - node.width/2 <= x1 + padding &&
-            node.y + node.height/2 >= y0 - padding &&
-            node.y - node.height/2 <= y1 + padding) {
-            visibleNodes.add(node.id);
-            
-            // Also add parent if not already visible (for links)
-            if (node.parentId !== null) {
-                visibleNodes.add(node.parentId);
-            }
-        }
-    });
-    
-    // Always include root node
-    if (allNodes.length > 0) {
-        visibleNodes.add(allNodes[0].id);
-    }
-}
-
-// Clear the view - remove all nodes
-function clearView() {
-    isCleared = true;
-    selectedResourceType = null;
-    
-    // Remove selection from all table rows
-    const tableContainer = document.getElementById('resourceTypeTableContainer');
-    if (tableContainer) {
-        tableContainer.querySelectorAll('.resource-type-row').forEach(r => {
-            r.classList.remove('selected');
+        // Build the full path so far (from JSON root)
+        const pathSoFar = path.slice(0, i + 1);
+        
+        // Try to find node with matching path
+        let node = allNodes.find(n => {
+            if (!n.jsonPath) return false;
+            if (n.jsonPath.length !== pathSoFar.length) return false;
+            return n.jsonPath.every((val, idx) => val === pathSoFar[idx]);
         });
+        
+        // If node doesn't exist, expand the parent to create it
+        if (!node && currentNode && currentNode.rawData) {
+            // Expand current node to create children
+            if (!currentNode.isExpanded) {
+                expandNode(currentNode);
+                // Force a small delay to ensure nodes are added
+                // Actually, expandNode should be synchronous, so nodes should be available immediately
+            }
+            
+            // Search again for the node after expansion
+            node = allNodes.find(n => {
+                if (!n.jsonPath) return false;
+                if (n.jsonPath.length !== pathSoFar.length) return false;
+                return n.jsonPath.every((val, idx) => val === pathSoFar[idx]);
+            });
+        }
+        
+        if (node) {
+            currentNode = node;
+        } else {
+            // If we still can't find it, log and continue - might be able to create it later
+            console.warn(`Could not find or create node at path: [${pathSoFar.join(', ')}]`);
+            console.warn(`Current node: ${currentNode.label}, path: [${(currentNode.jsonPath || []).join(', ')}]`);
+        }
     }
-    
-    // Clear focus and navigation
-    focusedNodeId = null;
-    navigationStack = [];
-    updateBackButtonVisibility();
-    
-    // Clear all nodes from view
-    nodes = [];
-    links = [];
-    
-    // Remove all nodes and links from DOM
-    if (g) {
-        g.selectAll('.node').remove();
-        g.selectAll('.link').remove();
-    }
-    
-    // Stop simulation
-    if (simulation) {
-        simulation.stop();
-        simulation = null;
-    }
-    
-    // Update the visualization to reflect cleared state
-    renderVisibleGraph();
 }
 
-// Build visible nodes and links arrays
-function buildVisibleGraph() {
-    // If view is cleared, show nothing
-    if (isCleared && selectedResourceType === null) {
-        nodes = [];
-        links = [];
+// Track if we've already expanded paths for the current resourceType filter
+let lastExpandedResourceType = null;
+
+function renderGraph() {
+    if (allNodes.length === 0) return;
+    
+    // If filtering by resourceType, expand all paths to matching nodes first
+    // Only expand if the resourceType filter changed
+    if (selectedResourceType !== null && lastExpandedResourceType !== selectedResourceType) {
+        console.log(`Expanding paths for resourceType: ${selectedResourceType}`);
+        expandPathsToResourceType(selectedResourceType);
+        lastExpandedResourceType = selectedResourceType;
+        // After expanding, wait a moment for all nodes to be created, then render again
+        setTimeout(() => {
+            console.log('Re-rendering after path expansion...');
+            renderGraph();
+        }, 100);
         return;
+    } else if (selectedResourceType === null) {
+        lastExpandedResourceType = null;
     }
     
-    // If filtering by resourceType, include matching nodes AND their parent tree
+    // Filter nodes based on current state
+    let visibleNodes = allNodes;
+    let visibleEdges = allEdges;
+    
+    // Apply resourceType filter - only show matching nodes and their direct ancestor paths (no siblings)
     if (selectedResourceType !== null) {
         const visibleNodeIds = new Set();
         
-        // Find all nodes matching the selected resourceType
+        // First, ensure we have all matching nodes
         const matchingNodes = allNodes.filter(n => n.resourceType === selectedResourceType);
+        console.log(`Filtering: Found ${matchingNodes.length} nodes with resourceType "${selectedResourceType}"`);
         
-        // For each matching node, add it and all its ancestors (parent tree)
+        // If no matching nodes found, they might not be expanded yet
+        // This should have been handled by expandPathsToResourceType above, but double-check
+        if (matchingNodes.length === 0) {
+            console.warn(`No matching nodes found for resourceType "${selectedResourceType}"`);
+            console.warn(`Total nodes in graph: ${allNodes.length}`);
+            console.warn('Sample node resourceTypes:', allNodes.slice(0, 10).map(n => n.resourceType).filter(rt => rt));
+            
+            // Try expanding paths again with more aggressive expansion
+            console.warn('Attempting to expand paths again...');
+            expandPathsToResourceType(selectedResourceType);
+            
+            // Wait a bit and re-render - but limit retries to avoid infinite loops
+            if (!renderGraph.retryCount) {
+                renderGraph.retryCount = 0;
+            }
+            if (renderGraph.retryCount < 3) {
+                renderGraph.retryCount++;
+                setTimeout(() => {
+                    renderGraph();
+                }, 300);
+            } else {
+                console.error('Failed to create nodes after multiple retries. Showing all nodes for debugging.');
+                // As a fallback, show all nodes so user can see what's in the graph
+                visibleNodes = allNodes;
+                visibleEdges = allEdges;
+                renderGraph.retryCount = 0;
+            }
+            return;
+        }
+        renderGraph.retryCount = 0; // Reset retry count on success
+        
+        // For each matching node, trace back to root and add only that specific path
         matchingNodes.forEach(matchingNode => {
             // Add the matching node itself
             visibleNodeIds.add(matchingNode.id);
             
-            // Trace back to root by following parentId chain
+            // Trace back to root, adding only nodes on this specific path
             let currentNode = matchingNode;
             while (currentNode.parentId !== null) {
                 const parentNode = allNodes.find(n => n.id === currentNode.parentId);
@@ -646,42 +941,30 @@ function buildVisibleGraph() {
             }
         });
         
-        // Filter nodes to only include those in our visible set
-        // (Only matching nodes and their parent tree - no descendants)
-        nodes = allNodes.filter(n => visibleNodeIds.has(n.id));
+        // Filter nodes - only include those in visibleNodeIds (matching nodes and their ancestors)
+        visibleNodes = allNodes.filter(n => visibleNodeIds.has(n.id));
         
-        // If focused on a node, only show that node and its ancestors (within the filtered set)
-        if (focusedNodeId !== null) {
-            const focusedNode = nodes.find(n => n.id === focusedNodeId);
-            if (focusedNode) {
-                const focusedNodeIds = new Set([focusedNodeId]);
-                // Add ancestors of focused node
-                let currentNode = focusedNode;
-                while (currentNode.parentId !== null) {
-                    if (visibleNodeIds.has(currentNode.parentId)) {
-                        focusedNodeIds.add(currentNode.parentId);
-                        currentNode = nodes.find(n => n.id === currentNode.parentId);
-                        if (!currentNode) break;
-                    } else {
-                        break;
-                    }
-                }
-                nodes = nodes.filter(n => focusedNodeIds.has(n.id));
-            } else {
-                nodes = [];
-            }
+        // Filter edges - only show edges between visible nodes
+        // Since we only include nodes on paths to matching nodes, edges between them are valid
+        visibleEdges = allEdges.filter(e => {
+            const fromId = typeof e.from === 'object' ? e.from.id : e.from;
+            const toId = typeof e.to === 'object' ? e.to.id : e.to;
+            return visibleNodeIds.has(fromId) && visibleNodeIds.has(toId);
+        });
+        
+        // If we still have no visible nodes after filtering, something went wrong
+        if (visibleNodes.length === 0 && matchingNodes.length > 0) {
+            console.warn('Filtering resulted in no visible nodes despite matching nodes existing');
         }
-    } else {
-        // No resourceType filter - use normal logic
-        let candidateNodes = allNodes;
-        
-        // If focused on a node, only show that node and its children
-        if (focusedNodeId !== null) {
-            const focusedNode = candidateNodes.find(n => n.id === focusedNodeId);
+    }
+    
+    // Apply focused node filter (drill-down)
+    if (focusedNodeId !== null && selectedResourceType === null) {
+        const focusedNode = allNodes.find(n => n.id === focusedNodeId);
             if (focusedNode) {
                 const descendantIds = new Set([focusedNodeId]);
                 function addDescendants(nodeId) {
-                    const node = candidateNodes.find(n => n.id === nodeId);
+                const node = allNodes.find(n => n.id === nodeId);
                     if (node && node.children) {
                         node.children.forEach(childId => {
                             descendantIds.add(childId);
@@ -690,344 +973,328 @@ function buildVisibleGraph() {
                     }
                 }
                 addDescendants(focusedNodeId);
-                nodes = candidateNodes.filter(n => descendantIds.has(n.id) && visibleNodes.has(n.id));
-            } else {
-                nodes = [];
-            }
-        } else {
-            // Normal viewport-based filtering when no filter is active
-            nodes = candidateNodes.filter(n => visibleNodes.has(n.id));
+            
+            visibleNodes = visibleNodes.filter(n => descendantIds.has(n.id));
+            visibleEdges = visibleEdges.filter(e => 
+                descendantIds.has(e.from) && descendantIds.has(e.to)
+            );
         }
     }
     
-    // Filter links to only include those where both source and target are visible
-    const visibleNodeIds = new Set(nodes.map(n => n.id));
-    links = allLinks.filter(link => {
-        const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
-        const targetId = typeof link.target === 'object' ? link.target.id : link.target;
-        return visibleNodeIds.has(sourceId) && visibleNodeIds.has(targetId);
-    });
-}
-
-function renderGraph() {
-    if (allNodes.length === 0) return;
+    // Handle cleared view
+    if (isCleared && selectedResourceType === null && focusedNodeId === null) {
+        visibleNodes = [];
+        visibleEdges = [];
+    }
     
-    tickUpdateCounter = 0;
-    lastTickTime = 0;
-    
-    // Calculate node sizes for all nodes first
-    allNodes.forEach(node => {
-        const text = node.label;
-        const lines = text.split('\n').length;
-        const maxLineLength = Math.max(...text.split('\n').map(l => l.length));
-        node.width = Math.max(120, maxLineLength * 7 + 30);
-        node.height = Math.max(40, lines * 20 + 20);
+    // Highlight focused node
+    visibleNodes.forEach(node => {
+        if (node.id === focusedNodeId) {
+            node.borderWidth = 4;
+            node.color.border = '#007bff';
+            } else {
+            node.borderWidth = 2;
+        }
         
-        // Add collapsed indicator (store original label)
-        node.originalLabel = node.label;
-        if (node.isCollapsed && node.childrenCount > 0) {
-            node.label = node.label + ' ▶';
+        // Highlight search matches
+        if (searchHighlightedNodes.has(node.id)) {
+            node.color.background = '#fff3cd';
+            node.color.border = '#ffc107';
         }
     });
     
-    // For very large graphs, reduce simulation iterations
-    const isLargeGraph = allNodes.length > 1000;
-    const alphaTarget = isLargeGraph ? 0.1 : 0.3;
+    // Update DataSets
+    nodesDataSet.clear();
+    edgesDataSet.clear();
     
-    // Run force simulation on all nodes (but we'll only render visible ones)
-    if (simulation) {
-        simulation.stop();
-    }
+    console.log(`Rendering: ${visibleNodes.length} visible nodes, ${visibleEdges.length} visible edges`);
     
-    simulation = d3.forceSimulation(allNodes)
-        .force('link', d3.forceLink(allLinks).id(d => d.id).distance(150))
-        .force('charge', d3.forceManyBody().strength(-300))
-        .force('center', d3.forceCenter(width / 2, height / 2))
-        .force('collision', d3.forceCollide().radius(d => Math.max(d.width, d.height) / 2 + 10))
-        .alphaDecay(isLargeGraph ? 0.05 : 0.02)
-        .velocityDecay(0.4)
-        .on('tick', () => {
-            // Throttle viewport updates during simulation
-            tickUpdateCounter++;
-            const now = performance.now();
-            if (now - lastTickTime > TICK_THROTTLE_MS || tickUpdateCounter % 3 === 0) {
-                updateVisibleNodes();
-                buildVisibleGraph();
-                renderVisibleGraph();
-                lastTickTime = now;
-            } else {
-                // Still update positions of visible nodes
-                renderVisibleGraph();
-            }
-        })
-        .on('end', () => {
-            // Final render when simulation ends
-            updateVisibleNodes();
-            buildVisibleGraph();
-            renderVisibleGraph();
-        });
-    
-    // Initial viewport update
-    updateVisibleNodes();
-    buildVisibleGraph();
-    renderVisibleGraph();
-    
-    // Auto-stop simulation after a timeout for large graphs
-    if (isLargeGraph) {
+    if (visibleNodes.length > 0) {
+        nodesDataSet.add(visibleNodes);
+        edgesDataSet.add(visibleEdges);
+        
+        // Explicitly trigger network update
+        if (network) {
+            network.redraw();
+        }
+        
+        // Fit to view after rendering
         setTimeout(() => {
-            if (simulation && simulation.alpha() > 0.05) {
-                simulation.alpha(0.05);
-            }
-        }, 2000);
-    }
-    
-    // Fit to view after initial render
-    setTimeout(() => {
-        if (simulation) {
-            simulation.stop();
+            fitToView();
+        }, 300);
+    } else {
+        console.warn('No visible nodes to render');
+        // Still update the network to clear it
+        if (network) {
+            network.redraw();
         }
-        fitToView();
-    }, 500);
+    }
 }
 
-// Render only visible nodes and links
-function renderVisibleGraph() {
-    // If filtering by resourceType, ensure we remove ALL nodes not in the filtered set
-    if (selectedResourceType !== null) {
-        const visibleNodeIds = new Set(nodes.map(n => n.id));
-        
-        // Force remove any nodes that aren't in our filtered set
-        g.selectAll('.node').each(function(d) {
-            if (!visibleNodeIds.has(d.id)) {
-                d3.select(this).remove();
-            }
-        });
-        
-        // Force remove any links that aren't in our filtered set
-        const visibleLinkIds = new Set(links.map(l => l.id || `link-${l.source.id || l.source}-${l.target.id || l.target}`));
-        g.selectAll('.link').each(function(d) {
-            const linkId = d.id || `link-${d.source.id || d.source}-${d.target.id || d.target}`;
-            if (!visibleLinkIds.has(linkId)) {
-                d3.select(this).remove();
-            }
-        });
+// Helper function to create a node (used by both buildGraph and expandNode)
+function createNodeForGraph(label, value, type, parentId, depth, rawData, childrenCount, isCollapsed, jsonPath, resourceType, isExpanded) {
+    const id = nodeIdCounter++;
+    
+    // Determine node color and styling (Neo4j-style)
+    let color = '#ffffff';
+    let borderColor = '#333333';
+    
+    if (type === 'color' && value) {
+        color = value;
+        borderColor = '#333333';
+    } else if (resourceType) {
+        color = getResourceTypeColor(resourceType);
+        const rgb = hexToRgb(color);
+        if (rgb) {
+            borderColor = `rgb(${Math.max(0, rgb.r - 40)}, ${Math.max(0, rgb.g - 40)}, ${Math.max(0, rgb.b - 40)})`;
+        }
+    } else {
+        switch(type) {
+            case 'array':
+                color = '#e3f2fd';
+                borderColor = '#2196f3';
+                break;
+            case 'object':
+                color = '#f3e5f5';
+                borderColor = '#9c27b0';
+                break;
+            case 'string':
+                color = '#e8f5e9';
+                borderColor = '#4caf50';
+                break;
+            case 'number':
+                color = '#fff3e0';
+                borderColor = '#ff9800';
+                break;
+            case 'boolean':
+                color = '#fce4ec';
+                borderColor = '#e91e63';
+                break;
+            default:
+                color = '#ffffff';
+                borderColor = '#333333';
+        }
     }
     
-    if (nodes.length === 0 && selectedResourceType !== null) {
-        // If no nodes match but we're filtering, ensure everything is removed
-        g.selectAll('.node').remove();
-        g.selectAll('.link').remove();
+    const textColor = getContrastColor(color);
+    
+    let displayLabel = label;
+    const hasChildren = (type === 'array' || type === 'object') && rawData !== null && 
+                      ((Array.isArray(rawData) && rawData.length > 0) || 
+                       (typeof rawData === 'object' && Object.keys(rawData).length > 0));
+    
+    const actuallyCollapsed = hasChildren && !isExpanded && !expandedNodes.has(id);
+    
+    if (actuallyCollapsed && childrenCount > 0) {
+        displayLabel = label + ' ▶';
+    }
+    
+    const newNode = {
+        id: id,
+        label: displayLabel,
+        title: label + (hasChildren ? ` (${childrenCount} ${childrenCount === 1 ? 'child' : 'children'})` : ''),
+        type: type,
+        parentId: parentId,
+        depth: depth,
+        rawData: rawData,
+        childrenCount: childrenCount,
+        isCollapsed: actuallyCollapsed,
+        children: [],
+        jsonPath: jsonPath || [],
+        resourceType: resourceType,
+        isExpanded: isExpanded || expandedNodes.has(id),
+        color: {
+            background: color,
+            border: borderColor,
+            highlight: {
+                background: color,
+                border: '#007bff'
+            },
+            hover: {
+                background: color,
+                border: '#0056b3'
+            }
+        },
+        font: {
+            color: textColor,
+            size: 14,
+            face: 'Arial'
+        },
+        shape: 'box',
+        borderWidth: 2,
+        shadow: true
+    };
+    
+    if (jsonPath) {
+        nodeJsonPath.set(id, jsonPath);
+    }
+    
+    if (parentId !== null) {
+        const edge = {
+            id: edgeIdCounter++,
+            from: parentId,
+            to: id,
+            label: '',
+            arrows: 'to',
+            color: {
+                color: '#999999',
+                highlight: '#007bff',
+                hover: '#0056b3'
+            },
+            width: 2,
+            smooth: {
+                type: 'curvedCW',
+                roundness: 0.2
+            }
+        };
+        allEdges.push(edge);
+        const parentNode = allNodes.find(n => n.id === parentId);
+        if (parentNode) {
+            parentNode.children.push(id);
+        }
+    }
+    
+    const existingNodeIndex = allNodes.findIndex(n => n.id === id);
+    if (existingNodeIndex === -1) {
+        allNodes.push(newNode);
+    } else {
+        allNodes[existingNodeIndex] = newNode;
+    }
+    
+    return id;
+}
+
+// Expand a node by loading its children (lazy loading)
+function expandNode(node) {
+    // Check if node can be expanded (has children and rawData)
+    if (!node.rawData || node.isExpanded) {
+        if (node.isCollapsed && node.childrenCount === 0) {
+            highlightJsonForNode(node);
+        }
         return;
     }
     
-    if (nodes.length === 0) return;
+    // Check if node has children to expand
+    const hasChildren = (node.type === 'array' || node.type === 'object') && 
+                       ((Array.isArray(node.rawData) && node.rawData.length > 0) || 
+                        (typeof node.rawData === 'object' && Object.keys(node.rawData).length > 0));
     
-    // Update or create links
-    const linkSelection = g.select('.links');
-    let linksGroup = linkSelection.empty() 
-        ? g.append('g').attr('class', 'links')
-        : linkSelection;
+    if (!hasChildren) {
+        highlightJsonForNode(node);
+        return;
+    }
     
-    const link = linksGroup
-        .selectAll('path.link')
-        .data(links, d => d.id || `link-${d.source.id || d.source}-${d.target.id || d.target}`);
+    // Mark node as expanded
+    expandedNodes.add(node.id);
+    node.isExpanded = true;
+    node.isCollapsed = false;
     
-    link.exit().remove();
-    
-    const linkEnter = link.enter()
-        .append('path')
-        .attr('class', 'link');
-    
-    const linkUpdate = linkEnter.merge(link);
-    
-    linkUpdate.attr('d', d => {
-        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
-        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
-        const source = allNodes.find(n => n.id === sourceId);
-        const target = allNodes.find(n => n.id === targetId);
-        if (!source || !target) return '';
+    // Function to create child nodes during expansion
+    function expandNodeChildren(value, key, parentId, parentPath = [], parentResourceType = null) {
+        const valueType = typeof value;
+        const depth = node.depth + 1;
+        // Build path: parentPath should already contain the full path to parent
+        const currentPath = parentPath.length > 0 ? [...parentPath, key] : [key];
         
-        const sx = source.x;
-        const sy = source.y;
-        const tx = target.x;
-        const ty = target.y;
-        
-        const dx = tx - sx;
-        const dy = ty - sy;
-        const dr = Math.sqrt(dx * dx + dy * dy) * 1.5;
-        
-        return `M ${sx} ${sy} A ${dr} ${dr} 0 0,1 ${tx} ${ty}`;
-    });
-    
-    // Update or create nodes
-    const nodeSelection = g.select('.nodes');
-    let nodesGroup = nodeSelection.empty()
-        ? g.append('g').attr('class', 'nodes')
-        : nodeSelection;
-    
-    const node = nodesGroup
-        .selectAll('g.node')
-        .data(nodes, d => d.id);
-    
-    // Remove all nodes that don't match the current filter
-    node.exit().remove();
-    
-    const nodeEnter = node.enter()
-        .append('g')
-        .attr('class', d => {
-            let classes = `node ${d.type}`;
-            if (d.isCollapsed) classes += ' collapsed';
-            if (d.id === focusedNodeId) classes += ' focused';
-            return classes;
-        })
-        .style('cursor', 'pointer');
-    
-    // Add rectangle
-    nodeEnter.append('rect')
-        .attr('width', d => d.width)
-        .attr('height', d => d.height)
-        .attr('rx', 6)
-        .attr('fill', d => {
-            if (d.type === 'color' && d.value) {
-                return d.value;
-            }
-            // Use resourceType color if available
-            if (d.resourceType) {
-                return getResourceTypeColor(d.resourceType);
-            }
-            return 'white';
-        })
-        .attr('stroke', d => {
-            // Use darker version of resourceType color for border
-            if (d.resourceType) {
-                return d3.rgb(getResourceTypeColor(d.resourceType)).darker(1.5);
-            }
-            return '#333';
-        })
-        .attr('stroke-width', 2);
-    
-    // Add text
-    nodeEnter.append('text')
-        .attr('x', d => d.width / 2)
-        .attr('y', d => d.height / 2)
-        .attr('text-anchor', 'middle')
-        .attr('dominant-baseline', 'middle')
-        .attr('class', 'node-title')
-        .attr('fill', d => {
-            // Use white text on colored backgrounds for better contrast
-            if (d.resourceType) {
-                const color = d3.rgb(getResourceTypeColor(d.resourceType));
-                // Calculate luminance to determine if we need white or black text
-                const luminance = (0.299 * color.r + 0.587 * color.g + 0.114 * color.b) / 255;
-                return luminance > 0.5 ? '#000' : '#fff';
-            }
-            return '#333';
-        })
-        .text(d => d.originalLabel || d.label.replace(' ▶', '')); // Use original label
-    
-    // Add color circle for color nodes
-    nodeEnter.filter(d => d.type === 'color')
-        .append('circle')
-        .attr('cx', d => d.width - 20)
-        .attr('cy', d => d.height / 2)
-        .attr('r', 8)
-        .attr('fill', d => d.value || 'white')
-        .attr('stroke', '#333')
-        .attr('stroke-width', 1);
-    
-    // Add click handler for all nodes
-    nodeEnter.on('click', (event, d) => {
-        event.stopPropagation();
-        
-        // Handle collapsed nodes - expand them
-        if (d.isCollapsed && d.childrenCount > 0) {
-            toggleNode(d, event);
-        } else if (d.childrenCount > 0 || d.type === 'object' || d.type === 'array') {
-            // Navigate into this node (drill-down)
-            focusOnNode(d);
-        } else {
-            // Leaf node - just highlight JSON
-            highlightJsonForNode(d);
+        if (value === null) {
+            return createNodeForGraph(`${key}: null`, 'null', 'null', parentId, depth, null, 0, false, currentPath, parentResourceType, false);
         }
-    });
-    
-    const nodeUpdate = nodeEnter.merge(node);
-    
-    // Update classes for focused state
-    nodeUpdate.attr('class', d => {
-        let classes = `node ${d.type}`;
-        if (d.isCollapsed) classes += ' collapsed';
-        if (d.id === focusedNodeId) classes += ' focused';
-        return classes;
-    });
-    
-    // Update fill and stroke colors for existing nodes
-    nodeUpdate.select('rect')
-        .attr('fill', d => {
-            if (d.type === 'color' && d.value) {
-                return d.value;
+        
+        if (valueType === 'object' && Array.isArray(value)) {
+            let currentResourceType = parentResourceType;
+            if (value.length > 0 && typeof value[0] === 'object' && value[0].resourceType) {
+                currentResourceType = value[0].resourceType;
             }
-            if (d.resourceType) {
-                return getResourceTypeColor(d.resourceType);
+            
+            return createNodeForGraph(
+                `${key}: [${value.length} items]`, 
+                '', 
+                'array', 
+                parentId, 
+                depth, 
+                value, 
+                value.length,
+                true,
+                currentPath,
+                currentResourceType,
+                false
+            );
+        } else if (valueType === 'object') {
+            const keys = Object.keys(value);
+            let currentResourceType = parentResourceType;
+            if (value.resourceType) {
+                currentResourceType = value.resourceType;
             }
-            return 'white';
-        })
-        .attr('stroke', d => {
-            if (d.resourceType) {
-                return d3.rgb(getResourceTypeColor(d.resourceType)).darker(1.5);
+            
+            let labelText;
+            if (value.resourceType) {
+                labelText = `${value.resourceType}`;
+            } else {
+                labelText = keys.length > 0 ? `${key}: {${keys.length} keys}` : `${key}: {}`;
             }
-            return '#333';
-        });
-    
-    // Update text color for existing nodes
-    nodeUpdate.select('text')
-        .attr('fill', d => {
-            if (d.resourceType) {
-                const color = d3.rgb(getResourceTypeColor(d.resourceType));
-                const luminance = (0.299 * color.r + 0.587 * color.g + 0.114 * color.b) / 255;
-                return luminance > 0.5 ? '#000' : '#fff';
+            
+            return createNodeForGraph(
+                labelText,
+                '',
+                'object',
+                parentId,
+                depth,
+                value,
+                keys.length,
+                true,
+                currentPath,
+                currentResourceType,
+                false
+            );
+        } else {
+            let displayValue = value;
+            if (valueType === 'string' && value.length > 30) {
+                displayValue = value.substring(0, 30) + '...';
             }
-            return '#333';
-        });
-    
-    nodeUpdate.attr('transform', d => `translate(${d.x - d.width/2}, ${d.y - d.height/2})`);
-    
-    // Make nodes draggable
-    nodeUpdate.call(d3.drag()
-        .on('start', dragStarted)
-        .on('drag', dragged)
-        .on('end', dragEnded));
-}
-
-function toggleNode(node, event) {
-    if (event) {
-        event.stopPropagation();
+            
+            let labelText = `${key}`;
+            if (valueType === 'string' && /^#[0-9A-Fa-f]{6}$/.test(value)) {
+                labelText = `${key}: ${value}`;
+                return createNodeForGraph(labelText, value, 'color', parentId, depth, null, 0, false, currentPath, parentResourceType, false);
+            } else {
+                labelText = `${key}: ${displayValue}`;
+            }
+            
+            return createNodeForGraph(labelText, value, valueType, parentId, depth, null, 0, false, currentPath, parentResourceType, false);
+        }
     }
     
-    if (!node.isCollapsed) {
-        // Collapse: remove children
-        expandedNodes.delete(node.id);
-    } else {
-        // Expand: add children
-        expandedNodes.add(node.id);
+    // Expand the node based on its type
+    if (node.type === 'array' && Array.isArray(node.rawData)) {
+        node.rawData.forEach((item, index) => {
+            expandNodeChildren(item, String(index), node.id, node.jsonPath, node.resourceType);
+        });
+    } else if (node.type === 'object' && typeof node.rawData === 'object') {
+        Object.entries(node.rawData).forEach(([key, value]) => {
+            let currentResourceType = node.resourceType;
+            if (value !== null && typeof value === 'object' && !Array.isArray(value) && value.resourceType) {
+                currentResourceType = value.resourceType;
+            }
+            expandNodeChildren(value, key, node.id, node.jsonPath, currentResourceType);
+        });
     }
     
-    // Rebuild graph with updated expansion state
-    buildGraph(jsonData);
+    // Update node label to remove collapsed indicator
+    node.label = node.label.replace(' ▶', '');
+    const nodeIndex = allNodes.findIndex(n => n.id === node.id);
+    if (nodeIndex !== -1) {
+        allNodes[nodeIndex] = node;
+    }
+    
+    // Re-render the graph
     renderGraph();
 }
 
-function rebuildNodeChildren(node) {
-    // This will be called when expanding - for now, we'll rebuild the whole graph
-    // A more optimized version would only rebuild the subtree
-}
-
-// Focus on a node (drill-down view)
 function focusOnNode(node) {
     // Highlight JSON first
     highlightJsonForNode(node);
     
-    // Add current focus to navigation stack if not already focused
+    // Add current focus to navigation stack
     if (focusedNodeId !== node.id) {
         if (focusedNodeId !== null) {
             navigationStack.push(focusedNodeId);
@@ -1035,58 +1302,34 @@ function focusOnNode(node) {
         focusedNodeId = node.id;
     }
     
-    // Update back button visibility
     updateBackButtonVisibility();
     
-    // Rebuild visible graph and render
-    // First, we need to rebuild the graph to ensure all children are created if node is collapsed
+    // Expand node if collapsed (drill-down view)
     if (node.isCollapsed && node.rawData && (node.type === 'object' || node.type === 'array')) {
-        // Make sure node is expanded so children exist
-        expandedNodes.add(node.id);
-        buildGraph(jsonData);
-    } else {
-        // Node is already expanded, just update the view
-        updateVisibleNodes();
-        buildVisibleGraph();
-        renderVisibleGraph();
+        expandNode(node);
     }
     
-    // Fit to new view
-    setTimeout(() => {
-        fitToView();
-    }, 100);
+    renderGraph();
 }
 
-// Navigate back one level
 function navigateBack() {
     if (navigationStack.length > 0) {
         focusedNodeId = navigationStack.pop();
         updateBackButtonVisibility();
         
-        // Highlight JSON for the node we're going back to
         const node = allNodes.find(n => n.id === focusedNodeId);
         if (node) {
             highlightJsonForNode(node);
         }
     } else {
-        // Go back to root view
         focusedNodeId = null;
         updateBackButtonVisibility();
         clearJsonHighlight();
     }
     
-    // Rebuild visible graph and render
-    updateVisibleNodes();
-    buildVisibleGraph();
-    renderVisibleGraph();
-    
-    // Fit to new view
-    setTimeout(() => {
-        fitToView();
-    }, 100);
+    renderGraph();
 }
 
-// Update back button visibility
 function updateBackButtonVisibility() {
     if (focusedNodeId !== null || navigationStack.length > 0) {
         backBtn.style.display = 'inline-block';
@@ -1098,29 +1341,24 @@ function updateBackButtonVisibility() {
 // Highlight JSON text for a node
 function highlightJsonForNode(node) {
     if (!node.jsonPath || node.jsonPath.length === 0) {
-        // Root node - highlight entire JSON
         highlightJsonRange(0, jsonEditor.value.length);
         return;
     }
     
-    // Find the JSON location based on path
     const location = findJsonPathLocation(jsonData, node.jsonPath, jsonEditor.value);
     if (location) {
         highlightJsonRange(location.start, location.end);
-        // Scroll to the highlighted section
         scrollToJsonPosition(location.start);
     }
 }
 
-// Find the character range in JSON text for a given path (simplified approach)
+// Find the character range in JSON text for a given path
 function findJsonPathLocation(data, path, jsonText) {
     if (!path || path.length === 0) {
         return { start: 0, end: jsonText.length };
     }
     
     try {
-        // Build a JSONPath-like pattern to find in the text
-        // Start from the beginning and navigate through the path
         let searchOffset = 0;
         let current = data;
         
@@ -1132,7 +1370,6 @@ function findJsonPathLocation(data, path, jsonText) {
                 if (isNaN(index) || index >= current.length) return null;
                 current = current[index];
                 
-                // For arrays, find the nth item
                 const result = findNthArrayItem(jsonText, searchOffset, index);
                 if (!result) return null;
                 searchOffset = result.start;
@@ -1140,11 +1377,9 @@ function findJsonPathLocation(data, path, jsonText) {
                 if (!(key in current)) return null;
                 current = current[key];
                 
-                // Find the property key: value in the text
                 const result = findPropertyLocation(jsonText, key, searchOffset);
                 if (!result) return null;
                 
-                // If this is the last element, return the value range
                 if (i === path.length - 1) {
                     return {
                         start: result.valueStart,
@@ -1152,14 +1387,12 @@ function findJsonPathLocation(data, path, jsonText) {
                     };
                 }
                 
-                // Otherwise, continue searching within the value
                 searchOffset = result.valueStart;
             } else {
                 return null;
             }
         }
         
-        // If we get here, we need to find the value at searchOffset
         const valueEnd = findValueEnd(jsonText, searchOffset);
         return {
             start: searchOffset,
@@ -1171,7 +1404,6 @@ function findJsonPathLocation(data, path, jsonText) {
     }
 }
 
-// Find the nth item in an array starting from offset
 function findNthArrayItem(text, startOffset, targetIndex) {
     let depth = 0;
     let inString = false;
@@ -1179,7 +1411,6 @@ function findNthArrayItem(text, startOffset, targetIndex) {
     let currentIndex = 0;
     let itemStart = -1;
     
-    // Find the opening bracket
     let bracketPos = -1;
     for (let i = startOffset; i < text.length; i++) {
         if (text[i] === '[') {
@@ -1230,7 +1461,6 @@ function findNthArrayItem(text, startOffset, targetIndex) {
         }
     }
     
-    // Check if it's the last item
     if (currentIndex === targetIndex && itemStart !== -1) {
         const closingBracket = text.indexOf(']', bracketPos);
         return { start: itemStart, end: closingBracket > -1 ? closingBracket : text.length };
@@ -1239,9 +1469,7 @@ function findNthArrayItem(text, startOffset, targetIndex) {
     return null;
 }
 
-// Find a property location in JSON text
 function findPropertyLocation(text, key, startOffset) {
-    // Escape key for regex
     const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const regex = new RegExp(`"${escapedKey}"\\s*:`, 'g');
     
@@ -1253,7 +1481,6 @@ function findPropertyLocation(text, key, startOffset) {
     const keyStart = match.index;
     const colonEnd = match.index + match[0].length;
     
-    // Skip whitespace
     let valueStart = colonEnd;
     while (valueStart < text.length && /\s/.test(text[valueStart])) {
         valueStart++;
@@ -1268,110 +1495,6 @@ function findPropertyLocation(text, key, startOffset) {
     };
 }
 
-// Helper function to find array item in JSON text
-function findArrayItemInText(text, index, startOffset) {
-    let depth = 0;
-    let inString = false;
-    let escapeNext = false;
-    let currentIndex = -1;
-    let itemStart = -1;
-    let bracketCount = 0;
-    
-    for (let i = startOffset; i < text.length; i++) {
-        const char = text[i];
-        
-        if (escapeNext) {
-            escapeNext = false;
-            continue;
-        }
-        
-        if (char === '\\') {
-            escapeNext = true;
-            continue;
-        }
-        
-        if (char === '"' && !escapeNext) {
-            inString = !inString;
-            continue;
-        }
-        
-        if (inString) continue;
-        
-        if (char === '[') {
-            if (depth === 0) {
-                currentIndex = -1;
-                itemStart = i + 1;
-            }
-            bracketCount++;
-        } else if (char === ']') {
-            bracketCount--;
-            if (bracketCount === 0 && currentIndex === index) {
-                return {
-                    offset: itemStart,
-                    text: text.substring(itemStart, i)
-                };
-            }
-        } else if (char === '{') {
-            depth++;
-        } else if (char === '}') {
-            depth--;
-        } else if (char === ',' && depth === 0 && bracketCount === 1) {
-            currentIndex++;
-            if (currentIndex === index) {
-                return {
-                    offset: itemStart,
-                    text: text.substring(itemStart, i)
-                };
-            }
-            itemStart = i + 1;
-        }
-    }
-    
-    // Handle last item
-    if (currentIndex + 1 === index) {
-        return {
-            offset: itemStart,
-            text: text.substring(itemStart)
-        };
-    }
-    
-    return null;
-}
-
-// Helper function to find property in JSON text
-function findPropertyInText(text, key, startOffset) {
-    const keyPattern = new RegExp(`"${key.replace(/"/g, '\\"')}"\\s*:`, 'g');
-    let match;
-    
-    // Search from startOffset
-    const searchText = text.substring(startOffset);
-    keyPattern.lastIndex = 0;
-    match = keyPattern.exec(searchText);
-    
-    if (match) {
-        const keyStart = startOffset + match.index;
-        const colonPos = startOffset + match.index + match[0].length;
-        
-        // Find the value start (skip whitespace after colon)
-        let valueStart = colonPos;
-        while (valueStart < text.length && /\s/.test(text[valueStart])) {
-            valueStart++;
-        }
-        
-        // Find the value end
-        const valueEnd = findValueEnd(text, valueStart);
-        
-        return {
-            start: keyStart,
-            valueStart: valueStart,
-            valueEnd: valueEnd
-        };
-    }
-    
-    return null;
-}
-
-// Helper function to find where a JSON value ends
 function findValueEnd(text, start) {
     let inString = false;
     let escapeNext = false;
@@ -1425,22 +1548,13 @@ function findValueEnd(text, start) {
     return text.length;
 }
 
-
-
-// Highlight a range in the JSON editor
 let highlightTimeout = null;
 function highlightJsonRange(start, end) {
-    // Clear previous highlight
     clearJsonHighlight();
     
-    // Select the range
     jsonEditor.focus();
     jsonEditor.setSelectionRange(start, end);
     
-    // Add a temporary highlight class via CSS (we'll add this)
-    // For now, we'll just scroll to it
-    
-    // Clear highlight after 3 seconds
     if (highlightTimeout) {
         clearTimeout(highlightTimeout);
     }
@@ -1449,153 +1563,199 @@ function highlightJsonRange(start, end) {
     }, 3000);
 }
 
-// Clear JSON highlight
 function clearJsonHighlight() {
     if (highlightTimeout) {
         clearTimeout(highlightTimeout);
         highlightTimeout = null;
     }
-    // Selection will be cleared when user interacts
 }
 
-// Scroll JSON editor to a position
 function scrollToJsonPosition(position) {
     const textBefore = jsonEditor.value.substring(0, position);
     const lines = textBefore.split('\n');
     const lineNumber = lines.length - 1;
     
-    // Calculate approximate scroll position
-    const lineHeight = 20; // Approximate line height in pixels
+    const lineHeight = 20;
     const visibleLines = jsonEditor.clientHeight / lineHeight;
     const targetScroll = Math.max(0, (lineNumber - visibleLines / 2) * lineHeight);
     
     jsonEditor.scrollTop = targetScroll;
 }
 
-function dragStarted(event, d) {
-    if (!event.active && simulation) {
-        simulation.alphaTarget(0.3).restart();
-    }
-    const node = allNodes.find(n => n.id === d.id);
-    if (node) {
-        node.fx = node.x;
-        node.fy = node.y;
-    }
-}
-
-function dragged(event, d) {
-    const node = allNodes.find(n => n.id === d.id);
-    if (node) {
-        node.fx = event.x;
-        node.fy = event.y;
-    }
-}
-
-function dragEnded(event, d) {
-    if (!event.active && simulation) {
-        simulation.alphaTarget(0);
-    }
-    const node = allNodes.find(n => n.id === d.id);
-    if (node) {
-        node.fx = null;
-        node.fy = null;
-    }
-}
-
 function zoomIn() {
-    svg.transition().call(zoom.scaleBy, 1.2);
+    if (network) {
+        const scale = network.getScale();
+        network.moveTo({ scale: scale * 1.2 });
+    }
 }
 
 function zoomOut() {
-    svg.transition().call(zoom.scaleBy, 0.8);
+    if (network) {
+        const scale = network.getScale();
+        network.moveTo({ scale: scale * 0.8 });
+    }
 }
 
 function fitToView() {
-    if (allNodes.length === 0) return;
-    
-    // Use filtered nodes if a resourceType filter is active
-    let nodesToFit = allNodes;
-    if (selectedResourceType !== null) {
-        nodesToFit = allNodes.filter(n => n.resourceType === selectedResourceType);
-        if (nodesToFit.length === 0) return; // No nodes to fit
+    if (network && allNodes.length > 0) {
+        network.fit({
+            animation: {
+                duration: 750,
+                easingFunction: 'easeInOutQuad'
+            }
+        });
     }
-    
-    // Calculate bounds from nodes to fit
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    nodesToFit.forEach(node => {
-        minX = Math.min(minX, node.x - node.width/2);
-        minY = Math.min(minY, node.y - node.height/2);
-        maxX = Math.max(maxX, node.x + node.width/2);
-        maxY = Math.max(maxY, node.y + node.height/2);
-    });
-    
-    const boundsWidth = maxX - minX;
-    const boundsHeight = maxY - minY;
-    const midX = (minX + maxX) / 2;
-    const midY = (minY + maxY) / 2;
-    
-    const fullWidth = width;
-    const fullHeight = height;
-    const widthScale = fullWidth / boundsWidth;
-    const heightScale = fullHeight / boundsHeight;
-    const scale = Math.min(widthScale, heightScale, 1) * 0.9;
-    
-    svg.transition()
-        .duration(750)
-        .call(
-            zoom.transform,
-            d3.zoomIdentity
-                .translate(fullWidth / 2 - scale * midX, fullHeight / 2 - scale * midY)
-                .scale(scale)
-        );
-    
-    // Update viewport after transform
-    setTimeout(() => {
-        updateVisibleNodes();
-        buildVisibleGraph();
-        renderVisibleGraph();
-    }, 100);
 }
 
 function handleSearch() {
     const searchTerm = searchInput.value.toLowerCase().trim();
+    searchHighlightedNodes.clear();
     
     if (!searchTerm) {
-        g.selectAll('.node').classed('highlighted', false);
+        renderGraph();
         return;
     }
     
-    // Highlight matching nodes (check all nodes, not just visible)
+    // Search through all nodes (including those not yet loaded)
+    // For nodes not yet in the graph, we need to search through the raw JSON data
+    function searchInData(data, path = [], parentNodeId = null) {
+        if (data === null || data === undefined) return;
+        
+        const dataType = typeof data;
+        
+        if (dataType === 'object' && Array.isArray(data)) {
+            data.forEach((item, index) => {
+                const currentPath = [...path, String(index)];
+                // Check if this item matches
+                if (JSON.stringify(item).toLowerCase().includes(searchTerm)) {
+                    // Need to expand path to this node
+                    expandPathToCreateNode(currentPath, parentNodeId);
+                }
+                searchInData(item, currentPath, parentNodeId);
+            });
+        } else if (dataType === 'object') {
+            Object.entries(data).forEach(([key, value]) => {
+                const currentPath = [...path, key];
+                // Check if key or value matches
+                if (key.toLowerCase().includes(searchTerm) || 
+                    (typeof value === 'string' && value.toLowerCase().includes(searchTerm))) {
+                    expandPathToCreateNode(currentPath, parentNodeId);
+                }
+                searchInData(value, currentPath, parentNodeId);
+            });
+        } else if (String(data).toLowerCase().includes(searchTerm)) {
+            expandPathToCreateNode(path, parentNodeId);
+        }
+    }
+    
+    // Helper to expand path and create nodes if needed
+    function expandPathToCreateNode(path, parentNodeId) {
+        // Expand all nodes in the path to make the target node visible
+        let currentData = jsonData;
+        let currentNodeId = null;
+        
+        for (let i = 0; i < path.length; i++) {
+            const key = path[i];
+            
+            // Navigate through the data
+            if (Array.isArray(currentData)) {
+                const index = parseInt(key);
+                if (isNaN(index) || index >= currentData.length) return;
+                currentData = currentData[index];
+            } else if (typeof currentData === 'object' && currentData !== null) {
+                if (!(key in currentData)) return;
+                currentData = currentData[key];
+            } else {
+                return;
+            }
+            
+            // Find or create node at this path level
+            const pathSoFar = path.slice(0, i + 1);
+            let node = allNodes.find(n => 
+                n.jsonPath && 
+                n.jsonPath.length === pathSoFar.length &&
+                n.jsonPath.every((val, idx) => val === pathSoFar[idx])
+            );
+            
+            if (!node && currentNodeId !== null) {
+                // Need to expand parent node to create this node
+                const parentNode = allNodes.find(n => n.id === currentNodeId);
+                if (parentNode && !parentNode.isExpanded) {
+                    expandNode(parentNode);
+                    // Find the newly created node
+                    node = allNodes.find(n => 
+                        n.jsonPath && 
+                        n.jsonPath.length === pathSoFar.length &&
+                        n.jsonPath.every((val, idx) => val === pathSoFar[idx])
+                    );
+                }
+            }
+            
+            if (node) {
+                currentNodeId = node.id;
+                if (i === path.length - 1) {
+                    // This is the target node - highlight it
+                    searchHighlightedNodes.add(node.id);
+                }
+            }
+        }
+    }
+    
+    // First, highlight existing nodes that match
     allNodes.forEach(node => {
         if (node.label.toLowerCase().includes(searchTerm)) {
-            // Expand path to node if needed
+            searchHighlightedNodes.add(node.id);
             expandPathToNode(node.id);
         }
     });
     
-    // Rebuild and render
-    buildGraph(jsonData);
-    renderGraph();
+    // Also search in JSON data for nodes that haven't been loaded yet
+    searchInData(jsonData);
     
-    // Highlight visible matching nodes
-    g.selectAll('.node')
-        .classed('highlighted', d => {
-            return d.label.toLowerCase().includes(searchTerm);
-        });
+    renderGraph();
 }
 
 function expandPathToNode(nodeId) {
-    // Expand all parent nodes up to the root
+    // Expand all parent nodes up to the root to reveal the target node
+    const pathToNode = [];
     let currentId = nodeId;
+    
+    // Build path from node to root
     while (currentId !== null) {
-        expandedNodes.add(currentId);
         const node = allNodes.find(n => n.id === currentId);
-        if (node && node.parentId !== null) {
+        if (node) {
+            pathToNode.unshift(node);
             currentId = node.parentId;
         } else {
             break;
         }
     }
+    
+    // Expand each node in the path
+    pathToNode.forEach(node => {
+        if (node.rawData && !node.isExpanded && (node.type === 'array' || node.type === 'object')) {
+            expandNode(node);
+        }
+    });
+}
+
+// Helper functions
+function hexToRgb(hex) {
+    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    return result ? {
+        r: parseInt(result[1], 16),
+        g: parseInt(result[2], 16),
+        b: parseInt(result[3], 16)
+    } : null;
+}
+
+function getContrastColor(hexColor) {
+    const rgb = hexToRgb(hexColor);
+    if (!rgb) return '#333333';
+    
+    // Calculate luminance
+    const luminance = (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
+    return luminance > 0.5 ? '#000000' : '#ffffff';
 }
 
 // Auto-validate JSON on paste
@@ -1608,8 +1768,6 @@ function getResourceTypeColor(resourceType) {
     if (!resourceType) return '#ffffff';
     
     if (!resourceTypeColors.has(resourceType)) {
-        // Generate a color based on the resourceType name
-        // Use a color palette that's visually distinct
         const colors = [
             '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
             '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E2',
@@ -1618,7 +1776,6 @@ function getResourceTypeColor(resourceType) {
             '#E84393', '#00CEC9', '#6C5CE7', '#FF7675', '#00B894'
         ];
         
-        // Use hash of resourceType name to pick a consistent color
         let hash = 0;
         for (let i = 0; i < resourceType.length; i++) {
             hash = resourceType.charCodeAt(i) + ((hash << 5) - hash);
@@ -1639,13 +1796,11 @@ function extractResourceTypes(data) {
             return;
         }
         
-        // If it's an object with resourceType property
         if (typeof obj === 'object' && !Array.isArray(obj) && obj.resourceType) {
             const resourceType = obj.resourceType;
             resourceTypeCounts.set(resourceType, (resourceTypeCounts.get(resourceType) || 0) + 1);
         }
         
-        // Recursively traverse arrays and objects
         if (Array.isArray(obj)) {
             obj.forEach(item => traverse(item));
         } else if (typeof obj === 'object') {
@@ -1657,191 +1812,204 @@ function extractResourceTypes(data) {
     return resourceTypeCounts;
 }
 
-// Update the resourceType table
+// Clear the view
+function clearView() {
+    isCleared = true;
+    selectedResourceType = null;
+    
+    // Update dropdown button
+    const dropdownButton = document.getElementById('resourceTypeDropdownButton');
+    if (dropdownButton) {
+        dropdownButton.textContent = 'Filter by Resource Type';
+    }
+    
+    // Update dropdown items
+    const dropdownMenu = document.getElementById('resourceTypeDropdownMenu');
+    if (dropdownMenu) {
+        dropdownMenu.querySelectorAll('.resource-type-dropdown-item').forEach(item => {
+            item.classList.remove('selected');
+        });
+    }
+    
+    focusedNodeId = null;
+    navigationStack = [];
+    updateBackButtonVisibility();
+    
+    renderGraph();
+}
+
+// Update the resourceType dropdown
 function updateResourceTypeTable(data) {
     const resourceTypeCounts = extractResourceTypes(data);
     
-    // Get or create the table container
-    let tableContainer = document.getElementById('resourceTypeTableContainer');
-    if (!tableContainer) {
-        tableContainer = document.createElement('div');
-        tableContainer.id = 'resourceTypeTableContainer';
-        tableContainer.className = 'resource-type-table-container';
-        
-        // Insert before the visualization panel
-        const rightPanel = document.querySelector('.right-panel');
-        const panelHeader = rightPanel.querySelector('.panel-header');
-        panelHeader.insertAdjacentElement('afterend', tableContainer);
+    // Remove old table container if it exists
+    const oldTableContainer = document.getElementById('resourceTypeTableContainer');
+    if (oldTableContainer) {
+        oldTableContainer.remove();
     }
     
-    // Clear existing content
-    tableContainer.innerHTML = '';
+    // Create dropdown container
+    let dropdownContainer = document.getElementById('resourceTypeDropdownContainer');
+    if (!dropdownContainer) {
+        dropdownContainer = document.createElement('div');
+        dropdownContainer.id = 'resourceTypeDropdownContainer';
+        dropdownContainer.className = 'resource-type-dropdown-container';
+        
+        const rightPanel = document.querySelector('.right-panel');
+        const panelHeader = rightPanel.querySelector('.panel-header');
+        panelHeader.insertAdjacentElement('afterend', dropdownContainer);
+    }
+    
+    dropdownContainer.innerHTML = '';
     
     if (resourceTypeCounts.size === 0) {
-        tableContainer.innerHTML = '<p class="no-resource-types">No resourceType attributes found in the JSON.</p>';
+        dropdownContainer.innerHTML = '<p class="no-resource-types">No resourceType attributes found in the JSON.</p>';
         return;
     }
     
-    // Create table
-    const table = document.createElement('table');
-    table.className = 'resource-type-table';
+    // Create dropdown button
+    const dropdownButton = document.createElement('button');
+    dropdownButton.className = 'resource-type-dropdown-button';
+    dropdownButton.id = 'resourceTypeDropdownButton';
     
-    // Create header with clear button
-    const thead = document.createElement('thead');
-    const headerRow = document.createElement('tr');
-    
-    const headerCell1 = document.createElement('th');
-    headerCell1.style.textAlign = 'left';
-    headerCell1.style.padding = '12px 15px';
-    
-    const headerText = document.createElement('span');
-    headerText.textContent = 'Resource Type';
-    
-    const clearBtn = document.createElement('button');
-    clearBtn.className = 'btn btn-clear';
-    clearBtn.textContent = 'Clear';
-    clearBtn.style.padding = '4px 12px';
-    clearBtn.style.fontSize = '12px';
-    clearBtn.style.marginLeft = '10px';
-    
-    clearBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        clearView();
-    });
-    
-    headerCell1.appendChild(headerText);
-    headerCell1.appendChild(clearBtn);
-    
-    const headerCell2 = document.createElement('th');
-    headerCell2.textContent = 'Count';
-    headerCell2.style.textAlign = 'right';
-    headerCell2.style.padding = '12px 15px';
-    
-    headerRow.appendChild(headerCell1);
-    headerRow.appendChild(headerCell2);
-    thead.appendChild(headerRow);
-    table.appendChild(thead);
-    
-    // Create body
-    const tbody = document.createElement('tbody');
-    
-    // Sort by count (descending), then by name
-    const sortedEntries = Array.from(resourceTypeCounts.entries())
-        .sort((a, b) => {
-            if (b[1] !== a[1]) return b[1] - a[1]; // Sort by count descending
-            return a[0].localeCompare(b[0]); // Then by name ascending
-        });
-    
-    sortedEntries.forEach(([resourceType, count]) => {
-        const row = document.createElement('tr');
-        row.className = 'resource-type-row';
-        if (selectedResourceType === resourceType) {
-            row.classList.add('selected');
-        }
-        
-        // Get color for this resourceType
-        const color = getResourceTypeColor(resourceType);
-        
-        // Create color indicator
+    if (selectedResourceType) {
+        const color = getResourceTypeColor(selectedResourceType);
         const colorIndicator = document.createElement('span');
         colorIndicator.className = 'resource-type-color-indicator';
         colorIndicator.style.backgroundColor = color;
-        colorIndicator.style.display = 'inline-block';
-        colorIndicator.style.width = '12px';
-        colorIndicator.style.height = '12px';
-        colorIndicator.style.borderRadius = '50%';
-        colorIndicator.style.marginRight = '8px';
-        colorIndicator.style.verticalAlign = 'middle';
+        dropdownButton.appendChild(colorIndicator);
+        dropdownButton.appendChild(document.createTextNode(selectedResourceType));
+    } else {
+        dropdownButton.textContent = 'Filter by Resource Type';
+    }
+    
+    // Create dropdown menu
+    const dropdownMenu = document.createElement('div');
+    dropdownMenu.className = 'resource-type-dropdown-menu';
+    dropdownMenu.id = 'resourceTypeDropdownMenu';
+    dropdownMenu.style.display = 'none';
+    
+    // Add "Clear" option
+    const clearOption = document.createElement('div');
+    clearOption.className = 'resource-type-dropdown-item';
+    clearOption.textContent = 'Clear Filter';
+    clearOption.addEventListener('click', (e) => {
+        e.stopPropagation();
+        clearView();
+        closeDropdown();
+        renderGraph();
+    });
+    dropdownMenu.appendChild(clearOption);
+    
+    // Add separator
+    const separator = document.createElement('div');
+    separator.className = 'resource-type-dropdown-separator';
+    dropdownMenu.appendChild(separator);
+    
+    // Add resource types
+    const sortedEntries = Array.from(resourceTypeCounts.entries())
+        .sort((a, b) => {
+            if (b[1] !== a[1]) return b[1] - a[1];
+            return a[0].localeCompare(b[0]);
+        });
+    
+    sortedEntries.forEach(([resourceType, count]) => {
+        const option = document.createElement('div');
+        option.className = 'resource-type-dropdown-item';
+        if (selectedResourceType === resourceType) {
+            option.classList.add('selected');
+        }
         
-        const typeCell = document.createElement('td');
-        typeCell.appendChild(colorIndicator);
-        typeCell.appendChild(document.createTextNode(resourceType));
+        const color = getResourceTypeColor(resourceType);
+        const colorIndicator = document.createElement('span');
+        colorIndicator.className = 'resource-type-color-indicator';
+        colorIndicator.style.backgroundColor = color;
         
-        const countCell = document.createElement('td');
-        countCell.textContent = count;
+        const label = document.createElement('span');
+        label.textContent = resourceType;
         
-        row.appendChild(typeCell);
-        row.appendChild(countCell);
+        const countSpan = document.createElement('span');
+        countSpan.className = 'resource-type-count';
+        countSpan.textContent = `(${count})`;
         
-        // Add click handler
-        row.addEventListener('click', () => {
-            // If view is cleared, un-clear it when selecting a resourceType
+        option.appendChild(colorIndicator);
+        option.appendChild(label);
+        option.appendChild(countSpan);
+        
+        option.addEventListener('click', (e) => {
+            e.stopPropagation();
+            
             if (isCleared) {
                 isCleared = false;
             }
             
-            // Toggle selection: if already selected, clear the view
             if (selectedResourceType === resourceType) {
                 clearView();
-                return;
             } else {
-                // Remove selection from all rows
-                tableContainer.querySelectorAll('.resource-type-row').forEach(r => {
-                    r.classList.remove('selected');
-                });
                 selectedResourceType = resourceType;
-                row.classList.add('selected');
+                // Update button text
+                dropdownButton.innerHTML = '';
+                dropdownButton.appendChild(colorIndicator.cloneNode(true));
+                dropdownButton.appendChild(document.createTextNode(resourceType));
             }
             
-            // Clear focus and navigation when filtering
             focusedNodeId = null;
             navigationStack = [];
             updateBackButtonVisibility();
             
-            // Rebuild and render graph with filter
-            updateVisibleNodes();
-            buildVisibleGraph();
+            closeDropdown();
+            renderGraph();
             
-            // Force complete removal of non-matching nodes by re-rendering
-            renderVisibleGraph();
-            
-            // If filtering, restart simulation with ONLY filtered nodes
-            if (selectedResourceType !== null) {
-                // Stop current simulation
-                if (simulation) {
-                    simulation.stop();
-                }
-                
-                // Create new simulation with ONLY the filtered nodes
-                const filteredNodes = nodes;
-                const filteredLinks = links;
-                
-                if (filteredNodes.length > 0) {
-                    // Calculate node sizes for filtered nodes
-                    filteredNodes.forEach(node => {
-                        const text = node.label;
-                        const lines = text.split('\n').length;
-                        const maxLineLength = Math.max(...text.split('\n').map(l => l.length));
-                        node.width = Math.max(120, maxLineLength * 7 + 30);
-                        node.height = Math.max(40, lines * 20 + 20);
-                    });
-                    
-                    simulation = d3.forceSimulation(filteredNodes)
-                        .force('link', d3.forceLink(filteredLinks).id(d => d.id).distance(150))
-                        .force('charge', d3.forceManyBody().strength(-300))
-                        .force('center', d3.forceCenter(width / 2, height / 2))
-                        .force('collision', d3.forceCollide().radius(d => Math.max(d.width, d.height) / 2 + 10))
-                        .alphaDecay(0.02)
-                        .velocityDecay(0.4)
-                        .on('tick', () => {
-                            renderVisibleGraph();
-                        })
-                        .on('end', () => {
-                            renderVisibleGraph();
-                            fitToView();
-                        });
-                }
-            }
-            
-            // Fit to view after filtering
             setTimeout(() => {
                 fitToView();
             }, 100);
         });
         
-        tbody.appendChild(row);
+        dropdownMenu.appendChild(option);
     });
     
-    table.appendChild(tbody);
-    tableContainer.appendChild(table);
+    // Toggle dropdown on button click
+    dropdownButton.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleDropdown();
+    });
+    
+    dropdownContainer.appendChild(dropdownButton);
+    dropdownContainer.appendChild(dropdownMenu);
+}
+
+// Close dropdown when clicking outside (set up once globally)
+let dropdownClickHandler = null;
+function setupDropdownClickOutside() {
+    if (dropdownClickHandler) {
+        document.removeEventListener('click', dropdownClickHandler);
+    }
+    dropdownClickHandler = (e) => {
+        const dropdownContainer = document.getElementById('resourceTypeDropdownContainer');
+        if (dropdownContainer && !dropdownContainer.contains(e.target)) {
+            closeDropdown();
+        }
+    };
+    document.addEventListener('click', dropdownClickHandler);
+}
+
+// Initialize dropdown click outside handler
+setupDropdownClickOutside();
+
+function toggleDropdown() {
+    const dropdownMenu = document.getElementById('resourceTypeDropdownMenu');
+    if (dropdownMenu) {
+        if (dropdownMenu.style.display === 'none') {
+            dropdownMenu.style.display = 'block';
+        } else {
+            dropdownMenu.style.display = 'none';
+        }
+    }
+}
+
+function closeDropdown() {
+    const dropdownMenu = document.getElementById('resourceTypeDropdownMenu');
+    if (dropdownMenu) {
+        dropdownMenu.style.display = 'none';
+    }
 }

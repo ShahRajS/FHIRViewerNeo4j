@@ -3,9 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>JSON Viewer</title>
+    <title>FHIR Viewer Neo4j</title>
     <link rel="stylesheet" href="style.css">
-    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -72,7 +72,7 @@
         <!-- Right Panel: Visualization -->
         <div class="right-panel">
             <div class="panel-header">
-                <h2>Visualization</h2>
+                <h2>Neo4j Graph Visualization</h2>
                 <div class="controls">
                     <button id="backBtn" class="btn btn-back" title="Go back" style="display: none;">← Back</button>
                     <label for="maxDepthInput" class="depth-label">Max Depth:</label>
@@ -82,7 +82,7 @@
                 </div>
             </div>
             <div class="viz-container" id="vizContainer">
-                <svg id="graphSvg"></svg>
+                <div id="neo4jNetwork"></div>
                 <div class="zoom-controls">
                     <button id="zoomInBtn" class="zoom-btn">+</button>
                     <button id="zoomOutBtn" class="zoom-btn">−</button>

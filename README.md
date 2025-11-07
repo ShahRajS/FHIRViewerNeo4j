@@ -1,12 +1,12 @@
-# JSON Viewer
+# FHIR Viewer Neo4j
 
-A modern, interactive web application for visualizing JSON data as an interactive node-link diagram.
+A modern, interactive web application for visualizing JSON/FHIR data as a Neo4j-style graph using vis.js Network visualization.
 
 ## Features
 
 - 📁 **File Upload**: Upload JSON files directly or drag and drop them into the editor
 - 📝 **Live JSON Editor**: Edit JSON directly in the left panel with real-time validation
-- 🎨 **Interactive Visualization**: View your JSON structure as a beautiful node-link diagram
+- 🎨 **Neo4j-Style Graph Visualization**: View your JSON structure as a beautiful graph using vis.js Network (Neo4j-compatible)
 - 🔍 **Search**: Search for nodes in the visualization (automatically expands to show matches)
 - 🔎 **Zoom & Pan**: 
   - Use zoom controls (+/-) to zoom in and out
@@ -14,12 +14,13 @@ A modern, interactive web application for visualizing JSON data as an interactiv
   - Click "Fit to View" to automatically fit the entire graph
   - Drag individual nodes to rearrange them
 - 🚀 **Performance Optimizations**:
-  - **Viewport Culling**: Only renders nodes visible in the current viewport
   - **Depth Limiting**: Control initial tree depth with the "Max Depth" setting
   - **Collapsible Nodes**: Click collapsed nodes (with ▶ indicator) to expand them
-  - **Throttled Updates**: Smooth performance even with large JSON files (3MB+)
+  - **Physics Simulation**: Neo4j-style physics engine for smooth graph layout
   - **Auto-optimization**: Automatically adjusts settings for large files
 - ✨ **Real-time Updates**: Changes to JSON are reflected in the visualization instantly
+- 🎯 **Resource Type Filtering**: Filter visualization by FHIR resource types with color coding
+- 🔄 **Drill-down Navigation**: Navigate into specific nodes with back button support
 
 ## How to Use
 
@@ -54,17 +55,17 @@ For JSON files over 3MB, the app automatically optimizes performance by:
 ## File Structure
 
 ```
-JSONViewer/
+FHIRViewerNeo4j/
 ├── index.html    # Main HTML structure
 ├── style.css     # Styling
-├── script.js     # Application logic and visualization
+├── script.js     # Application logic and Neo4j-style graph visualization
 └── README.md     # This file
 ```
 
 ## Technologies Used
 
-- **D3.js v7**: For creating the interactive graph visualization
-- **Vanilla JavaScript**: For all application logic
+- **vis.js Network**: For Neo4j-style graph visualization (compatible with Neo4j graph structures)
+- **Vanilla JavaScript**: For all application logic and JSON to graph conversion
 - **CSS3**: For modern, responsive styling
 
 ## Browser Compatibility

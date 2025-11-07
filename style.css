@@ -201,13 +201,14 @@ body {
     background-size: 20px 20px;
 }
 
-#graphSvg {
+#neo4jNetwork {
     width: 100%;
     height: 100%;
     cursor: grab;
+    position: relative;
 }
 
-#graphSvg:active {
+#neo4jNetwork:active {
     cursor: grabbing;
 }
 
@@ -242,98 +243,8 @@ body {
     box-shadow: 0 2px 8px rgba(0,0,0,0.15);
 }
 
-/* Node Styling */
-.node {
-    cursor: pointer;
-    transition: all 0.2s;
-}
-
-.node rect {
-    fill: white;
-    stroke: #333;
-    stroke-width: 2px;
-    rx: 6;
-    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1));
-}
-
-.node:hover rect {
-    stroke: #007bff;
-    stroke-width: 3px;
-    filter: drop-shadow(0 4px 8px rgba(0,0,0,0.2));
-}
-
-.node text {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    font-size: 13px;
-    pointer-events: none;
-}
-
-.node-title {
-    font-weight: 600;
-    fill: #333;
-}
-
-.node-value {
-    fill: #666;
-    font-size: 12px;
-}
-
-.node-color {
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    display: inline-block;
-    margin-right: 6px;
-    vertical-align: middle;
-    border: 1px solid #ddd;
-}
-
-/* Edge/Link Styling */
-.link {
-    fill: none;
-    stroke: #999;
-    stroke-width: 2px;
-    opacity: 0.6;
-}
-
-.link:hover {
-    stroke: #007bff;
-    opacity: 1;
-    stroke-width: 3px;
-}
-
-/* Highlighted nodes */
-.node.highlighted rect {
-    fill: #fff3cd;
-    stroke: #ffc107;
-}
-
-.node.highlighted path {
-    fill: #fff3cd;
-    stroke: #ffc107;
-}
-
-.node.collapsed rect {
-    stroke-dasharray: 5,5;
-    opacity: 0.8;
-}
-
-.node.collapsed:hover rect {
-    stroke-dasharray: none;
-    opacity: 1;
-}
-
-.node.focused rect {
-    stroke: #007bff;
-    stroke-width: 3px;
-    fill: #e7f3ff;
-    filter: drop-shadow(0 4px 8px rgba(0,123,255,0.3));
-}
-
-.node.focused:hover rect {
-    stroke: #0056b3;
-    stroke-width: 3px;
-}
+/* Neo4j Network Styling - handled by vis.js */
+/* Additional custom styles can be added here for vis.js network customization */
 
 /* Loading state */
 .loading {
@@ -351,76 +262,92 @@ body {
     display: none;
 }
 
-/* Resource Type Table */
-.resource-type-table-container {
+/* Resource Type Dropdown */
+.resource-type-dropdown-container {
     padding: 15px 20px;
     border-bottom: 1px solid #eee;
     background: #fafafa;
-    max-height: 300px;
-    overflow-y: auto;
+    position: relative;
 }
 
-.resource-type-table {
+.resource-type-dropdown-button {
     width: 100%;
-    border-collapse: collapse;
-    background: white;
+    padding: 10px 15px;
+    border: 1px solid #ddd;
     border-radius: 4px;
-    overflow: hidden;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-}
-
-.resource-type-table thead {
-    background: #007bff;
-    color: white;
-}
-
-.resource-type-table th {
-    padding: 12px 15px;
+    background: white;
+    cursor: pointer;
+    font-size: 14px;
     text-align: left;
-    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.2s;
+}
+
+.resource-type-dropdown-button:hover {
+    border-color: #007bff;
+    background: #f8f9fa;
+}
+
+.resource-type-dropdown-button:focus {
+    outline: none;
+    border-color: #007bff;
+    box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.1);
+}
+
+.resource-type-dropdown-menu {
+    position: absolute;
+    top: calc(100% + 5px);
+    left: 20px;
+    right: 20px;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    max-height: 400px;
+    overflow-y: auto;
+    z-index: 1000;
+}
+
+.resource-type-dropdown-item {
+    padding: 10px 15px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: background-color 0.2s;
     font-size: 14px;
 }
 
-.resource-type-table th:last-child {
-    text-align: right;
-}
-
-.resource-type-table tbody tr {
-    border-bottom: 1px solid #eee;
-    transition: background-color 0.2s;
-}
-
-.resource-type-table tbody tr:hover {
+.resource-type-dropdown-item:hover {
     background-color: #f8f9fa;
 }
 
-.resource-type-table tbody tr.resource-type-row {
-    cursor: pointer;
-}
-
-.resource-type-table tbody tr.resource-type-row.selected {
+.resource-type-dropdown-item.selected {
     background-color: #e7f3ff;
-    border-left: 3px solid #007bff;
-}
-
-.resource-type-table tbody tr.resource-type-row.selected:hover {
-    background-color: #d1e7ff;
-}
-
-.resource-type-table tbody tr:last-child {
-    border-bottom: none;
-}
-
-.resource-type-table td {
-    padding: 10px 15px;
-    font-size: 13px;
-    color: #333;
-}
-
-.resource-type-table td:last-child {
-    text-align: right;
     font-weight: 600;
-    color: #007bff;
+}
+
+.resource-type-dropdown-item .resource-type-count {
+    margin-left: auto;
+    color: #666;
+    font-size: 12px;
+}
+
+.resource-type-dropdown-separator {
+    height: 1px;
+    background: #eee;
+    margin: 5px 0;
+}
+
+.resource-type-color-indicator {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    vertical-align: middle;
+    flex-shrink: 0;
 }
 
 .no-resource-types {
