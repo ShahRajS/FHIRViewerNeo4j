@@ -1,0 +1,19 @@
+{
+  "name": "fhir-viewer-neo4j",
+  "version": "1.0.0",
+  "description": "FHIR Viewer with Neo4j-style graph visualization using vis.js Network",
+  "main": "index.html",
+  "scripts": {
+    "start": "npx serve ."
+  },
+  "keywords": [
+    "fhir",
+    "neo4j",
+    "graph",
+    "visualization",
+    "vis.js"
+  ],
+  "author": "",
+  "license": "MIT"
+}
+
